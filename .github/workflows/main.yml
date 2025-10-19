@@ -6,33 +6,28 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 jam max
+    timeout-minutes: 360  # 6 jam
 
     steps:
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
-          # Enable RDP, disable NLA untuk kemudahan connect
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-
-          # Firewall allow port 3389
           netsh advfirewall firewall delete rule name="FreeRDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="FreeRDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Restart service
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured successfully."
+          Write-Host "RDP configured."
 
       - name: Create RDP User with Secure Password
         shell: powershell
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper = [char[]](65..90)      # A-Z
-              Lower = [char[]](97..122)     # a-z
-              Number = [char[]](48..57)     # 0-9
+              Upper = [char[]](65..90)
+              Lower = [char[]](97..122)
+              Number = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
@@ -42,28 +37,19 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires $true
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          # Simpan untuk env dan output parsing
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          # Output eksplisit untuk skrip Python parse
-          Write-Host "=== FreeRDP ACCESS INFO ==="
+          Write-Host "=== FreeRDP CREDENTIALS ==="
           Write-Host "Username: RDP"
           Write-Host "Password: $password"
           Write-Host "=========================="
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          if (-not (Get-LocalUser -Name "RDP")) { Write-Error "User failed"; exit 1 }
 
       - name: Install Tailscale
         shell: powershell
         run: |
-          # Download latest Tailscale MSI
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
@@ -74,11 +60,8 @@ jobs:
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
-          # Start Tailscale
           $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
-          
-          # Wait and get IP
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-$env:GITHUB_RUN_ID --accept-routes
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
@@ -87,33 +70,24 @@ jobs:
               if ($ipOutput) { $tsIP = $ipOutput.Trim() }
               $retries++
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned"
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "No IP"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          
-          # Output untuk parsing
           Write-Host "Tailscale IP: $tsIP"
-          Write-Host "RDP ready at $tsIP:3389"
+          Write-Host "RDP at $tsIP:3389"
 
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "RDP port 3389 not accessible"
-              exit 1
-          }
-          Write-Host "RDP verification successful on $env:TAILSCALE_IP"
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) { Write-Error "Port failed"; exit 1 }
+          Write-Host "RDP verified on $env:TAILSCALE_IP"
 
       - name: Maintain Connection
         shell: powershell
         run: |
-          $endTime = (Get-Date).AddMinutes(350)  # End 10 menit sebelum timeout
+          $endTime = (Get-Date).AddMinutes(350)
           while ((Get-Date) -lt $endTime) {
-              Write-Host "[$(Get-Date)] FreeRDP Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
-              Start-Sleep -Seconds 300  # Log setiap 5 menit
+              Write-Host "[$(Get-Date)] Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
+              Start-Sleep -Seconds 300
           }
-          Write-Host "Approaching GitHub timeout - restart workflow if needed."
+          Write-Host "Timeout near - restart if needed."
