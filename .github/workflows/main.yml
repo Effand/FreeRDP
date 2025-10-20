@@ -18,8 +18,7 @@ jobs:
       - name: Track Run ID
         shell: powershell
         run: |
-          # Step name will be used to match ID in polling
-          $runId = "${{ github.event.inputs.run_id }}"
+          $runId = "${{ github.event.inputs.run_id || 'default' }}"
           Write-Host "Unique Run ID: $runId"
           echo "TRACK_RUN_ID=$runId" >> $env:GITHUB_ENV
 
@@ -32,7 +31,7 @@ jobs:
           netsh advfirewall firewall delete rule name="FreeRDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="FreeRDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured."
+          Write-Host "RDP configured successfully."
 
       - name: Create RDP User with Secure Password
         shell: powershell
@@ -60,29 +59,60 @@ jobs:
           Write-Host "Password: $password"
           Write-Host "=========================="
 
-      - name: Install Tailscale
+      - name: Install Tailscale with Retry
         shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          $maxRetries = 3
+          $retry = 0
+          $success = $false
+          while ($retry -lt $maxRetries -and -not $success) {
+              try {
+                  Write-Host "Download attempt $($retry + 1)/$maxRetries"
+                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 60 -ErrorAction Stop
+                  $success = $true
+                  Write-Host "Download succeeded!"
+              } catch {
+                  Write-Host "Download failed: $($_.Exception.Message)"
+                  $retry++
+                  if ($retry -lt $maxRetries) {
+                      Start-Sleep -Seconds 10
+                  }
+              }
+          }
+          if (-not $success) {
+              Write-Error "Download failed after $maxRetries attempts"
+              exit 1
+          }
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully."
 
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
           $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-${{ github.run_id }} --accept-routes
+          if (-not (Test-Path $tailscalePath)) {
+              Write-Error "Tailscale not found after install"
+              exit 1
+          }
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-${{ github.run_id }} --accept-routes --accept-dns=false
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              Start-Sleep -Seconds 3
+          while (-not $tsIP -and $retries -lt 30) {
+              Start-Sleep -Seconds 5
               $ipOutput = & $tailscalePath ip --4 2>$null
-              if ($ipOutput) { $tsIP = $ipOutput.Trim() }
+              if ($ipOutput) { 
+                  $tsIP = $ipOutput.Trim() 
+                  Write-Host "Got IP on retry $($retries + 1): $tsIP"
+              }
               $retries++
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP failed"; exit 1 }
+          if (-not $tsIP) { 
+              Write-Error "Failed to get Tailscale IP after retries"
+              exit 1 
+          }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $tsIP"
 
@@ -90,7 +120,10 @@ jobs:
         shell: powershell
         run: |
           $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $test.TcpTestSucceeded) { Write-Error "RDP port failed"; exit 1 }
+          if (-not $test.TcpTestSucceeded) { 
+              Write-Error "RDP port 3389 not accessible: $($test.TcpTestSucceeded)"
+              exit 1 
+          }
           Write-Host "RDP verified on $env:TAILSCALE_IP:3389"
 
       - name: Maintain Connection
@@ -98,6 +131,7 @@ jobs:
         run: |
           $endTime = (Get-Date).AddMinutes(350)
           while ((Get-Date) -lt $endTime) {
-              Write-Host "[$(Get-Date)] Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
+              Write-Host "[$(Get-Date)] FreeRDP Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
               Start-Sleep -Seconds 300
           }
+          Write-Host "Session ending due to timeout."
