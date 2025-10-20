@@ -2,13 +2,27 @@ name: FreeRDP
 
 on:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Unique run identifier'
+        required: false
+        type: string
+        default: 'default'
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 jam
+    timeout-minutes: 360
 
     steps:
+      - name: Track Run ID
+        shell: powershell
+        run: |
+          # Step name will be used to match ID in polling
+          $runId = "${{ github.event.inputs.run_id }}"
+          Write-Host "Unique Run ID: $runId"
+          echo "TRACK_RUN_ID=$runId" >> $env:GITHUB_ENV
+
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
@@ -45,7 +59,6 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $password"
           Write-Host "=========================="
-          if (-not (Get-LocalUser -Name "RDP")) { Write-Error "User failed"; exit 1 }
 
       - name: Install Tailscale
         shell: powershell
@@ -55,13 +68,12 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
           Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed."
 
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
           $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-$env:GITHUB_RUN_ID --accept-routes
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-${{ github.run_id }} --accept-routes
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
@@ -70,17 +82,16 @@ jobs:
               if ($ipOutput) { $tsIP = $ipOutput.Trim() }
               $retries++
           }
-          if (-not $tsIP) { Write-Error "No IP"; exit 1 }
+          if (-not $tsIP) { Write-Error "Tailscale IP failed"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $tsIP"
-          Write-Host "RDP at $tsIP:3389"
 
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
           $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $test.TcpTestSucceeded) { Write-Error "Port failed"; exit 1 }
-          Write-Host "RDP verified on $env:TAILSCALE_IP"
+          if (-not $test.TcpTestSucceeded) { Write-Error "RDP port failed"; exit 1 }
+          Write-Host "RDP verified on $env:TAILSCALE_IP:3389"
 
       - name: Maintain Connection
         shell: powershell
@@ -90,4 +101,3 @@ jobs:
               Write-Host "[$(Get-Date)] Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
               Start-Sleep -Seconds 300
           }
-          Write-Host "Timeout near - restart if needed."
