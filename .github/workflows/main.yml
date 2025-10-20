@@ -1,4 +1,4 @@
-name: FreeRDP
+name: RDP
 
 on:
   workflow_dispatch:
@@ -12,36 +12,40 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
       - name: Track Run ID
         shell: powershell
         run: |
           $runId = "${{ github.event.inputs.run_id || 'default' }}"
-          Write-Host "Unique Run ID: $runId"
-          echo "TRACK_RUN_ID=$runId" >> $env:GITHUB_ENV
+          Write-Host "TRACK_ID: $runId"  # For parsing match
 
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
+          # Enable Remote Desktop and disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="FreeRDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="FreeRDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Restart service
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured successfully."
+          Write-Host "RDP configured."
 
       - name: Create RDP User with Secure Password
         shell: powershell
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              Upper = [char[]](65..90)  # A-Z
+              Lower = [char[]](97..122) # a-z
+              Number = [char[]](48..57) # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # Special
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -53,99 +57,96 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "=== FreeRDP CREDENTIALS ==="
-          Write-Host "Username: RDP"
-          Write-Host "Password: $password"
-          Write-Host "=========================="
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+          
+          # Echo for parsing
+          Write-Host "PASS: $password"  # Clear format for regex
 
-      - name: Install Tailscale with Bitsadmin Retry
+      - name: Install Tailscale with Retry
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"  # Your working specific version
           $installerPath = "$env:TEMP\tailscale.msi"
-          # Flush DNS cache to help resolution
+          
+          # Flush DNS
           ipconfig /flushdns 2>$null
-          $maxRetries = 5
+          
+          $maxRetries = 3
           $retry = 0
           $success = $false
           while ($retry -lt $maxRetries -and -not $success) {
               try {
-                  Write-Host "Download attempt $($retry + 1)/$maxRetries using bitsadmin"
-                  # Use bitsadmin for reliable download on Windows
-                  bitsadmin /transfer "TailscaleDownload" $tsUrl $installerPath /priority normal
-                  if (Test-Path $installerPath) {
-                      $fileSize = (Get-Item $installerPath).Length
-                      Write-Host "Downloaded file size: $fileSize bytes"
-                      if ($fileSize -gt 40000000) {  # ~40MB check
-                          $success = $true
-                          Write-Host "Download succeeded with bitsadmin!"
-                      } else {
-                          Remove-Item $installerPath -Force
-                          throw "File too small, retrying"
-                      }
-                  }
+                  Write-Host "Download attempt $($retry + 1)/$maxRetries"
+                  Invoke-WebRequest -Uri $tsUrl -OutFile "`"$installerPath`"" -TimeoutSec 90 -ErrorAction Stop
+                  $success = $true
+                  Write-Host "Download succeeded!"
               } catch {
                   Write-Host "Download failed: $($_.Exception.Message)"
-                  if (Test-Path $installerPath) { Remove-Item $installerPath -Force }
+                  Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
                   $retry++
                   if ($retry -lt $maxRetries) {
-                      Start-Sleep -Seconds 15
-                      ipconfig /flushdns 2>$null  # Flush DNS each retry
+                      Start-Sleep -Seconds 10
+                      ipconfig /flushdns 2>$null
                   }
               }
           }
           if (-not $success) {
-              Write-Error "Download failed after $maxRetries attempts - DNS/ network issue"
+              Write-Error "Download failed after retries"
               exit 1
           }
-          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
+          
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed successfully."
 
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
-          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tailscalePath)) {
-              Write-Error "Tailscale not found after install"
-              exit 1
-          }
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=free-rdp-${{ github.run_id }} --accept-routes --accept-dns=false
+          # Up Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }} --accept-routes --accept-dns=false
+          
+          # Wait IP with retry
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 30) {
+          while (-not $tsIP -and $retries -lt 20) {  # More retries
               Start-Sleep -Seconds 5
-              $ipOutput = & $tailscalePath ip --4 2>$null
-              if ($ipOutput) { 
-                  $tsIP = $ipOutput.Trim() 
-                  Write-Host "Got IP on retry $($retries + 1): $tsIP"
+              $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($ipOutput -and $ipOutput.Trim()) {
+                  $tsIP = $ipOutput.Trim()
+                  Write-Host "IP: $tsIP"  # Clear format for parsing
               }
               $retries++
           }
-          if (-not $tsIP) { 
-              Write-Error "Failed to get Tailscale IP after retries"
-              exit 1 
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
 
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $test.TcpTestSucceeded) { 
-              Write-Error "RDP port 3389 not accessible: $($test.TcpTestSucceeded)"
-              exit 1 
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP port failed"
+              exit 1
           }
-          Write-Host "RDP verified on $env:TAILSCALE_IP:3389"
+          Write-Host "RDP verified."
 
       - name: Maintain Connection
         shell: powershell
         run: |
-          $endTime = (Get-Date).AddMinutes(350)
-          while ((Get-Date) -lt $endTime) {
-              Write-Host "[$(Get-Date)] FreeRDP Active - IP: $env:TAILSCALE_IP | User: RDP | Pass: $env:RDP_PASSWORD"
+          Write-Host "`n=== RDP READY ==="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "USER: RDP"
+          Write-Host "PASS: $env:RDP_PASSWORD"  # Fallback if not echoed
+          Write-Host "================`n"
+          
+          # Loop active
+          while ($true) {
+              Write-Host "[$(Get-Date)] Active - Connect via Tailscale to IP: $env:TAILSCALE_IP"
               Start-Sleep -Seconds 300
           }
-          Write-Host "Session ending due to timeout."
