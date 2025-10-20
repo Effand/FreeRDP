@@ -19,21 +19,16 @@ jobs:
         shell: powershell
         run: |
           $runId = "${{ github.event.inputs.run_id || 'default' }}"
-          Write-Host "TRACK_ID: $runId"  # For parsing match
+          Write-Host "TRACK_ID: $runId"
 
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
-          # Enable Remote Desktop and disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-
-          # Firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Restart service
           Restart-Service -Name TermService -Force
           Write-Host "RDP configured."
 
@@ -42,10 +37,10 @@ jobs:
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper = [char[]](65..90)  # A-Z
-              Lower = [char[]](97..122) # a-z
-              Number = [char[]](48..57) # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # Special
+              Upper = [char[]](65..90)
+              Lower = [char[]](97..122)
+              Number = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -63,33 +58,44 @@ jobs:
               exit 1
           }
           
-          # Echo for parsing
-          Write-Host "PASS: $password"  # Clear format for regex
+          Write-Host "PASS: $password"
 
       - name: Install Tailscale with Retry
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"  # Your working specific version
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale.msi"  # Latest stable v1.88.4
+          $tempDir = "C:\temp"
+          $installerPath = "$tempDir\tailscale.msi"
+          
+          # Create fixed temp dir
+          if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
           
           # Flush DNS
           ipconfig /flushdns 2>$null
+          Write-Host "DNS cache flushed."
           
           $maxRetries = 3
           $retry = 0
           $success = $false
           while ($retry -lt $maxRetries -and -not $success) {
+              $retry++
+              Write-Host "Download attempt $retry/$maxRetries"
+              # Clear old file
+              if (Test-Path $installerPath) { Remove-Item $installerPath -Force }
               try {
-                  Write-Host "Download attempt $($retry + 1)/$maxRetries"
-                  Invoke-WebRequest -Uri $tsUrl -OutFile "`"$installerPath`"" -TimeoutSec 90 -ErrorAction Stop
-                  $success = $true
-                  Write-Host "Download succeeded!"
+                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 120 -ErrorAction Stop
+                  $fileSize = (Get-Item $installerPath).Length
+                  if ($fileSize -gt 40000000) {  # Validate ~40MB+
+                      $success = $true
+                      Write-Host "Download succeeded! Size: $fileSize bytes"
+                  } else {
+                      throw "File too small"
+                  }
               } catch {
                   Write-Host "Download failed: $($_.Exception.Message)"
                   Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-                  $retry++
                   if ($retry -lt $maxRetries) {
-                      Start-Sleep -Seconds 10
+                      Start-Sleep -Seconds 15
                       ipconfig /flushdns 2>$null
                   }
               }
@@ -99,24 +105,29 @@ jobs:
               exit 1
           }
           
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed successfully."
 
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
-          # Up Tailscale
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }} --accept-routes --accept-dns=false
+          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscalePath)) {
+              Write-Error "Tailscale exe not found"
+              exit 1
+          }
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }} --accept-routes --accept-dns=false
           
-          # Wait IP with retry
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {  # More retries
+          while (-not $tsIP -and $retries -lt 30) {
               Start-Sleep -Seconds 5
-              $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              $ipOutput = & $tailscalePath ip --4 2>$null
               if ($ipOutput -and $ipOutput.Trim()) {
                   $tsIP = $ipOutput.Trim()
-                  Write-Host "IP: $tsIP"  # Clear format for parsing
+                  Write-Host "IP: $tsIP"
+                  break
               }
               $retries++
           }
@@ -129,7 +140,7 @@ jobs:
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "RDP port failed"
               exit 1
@@ -140,13 +151,12 @@ jobs:
         shell: powershell
         run: |
           Write-Host "`n=== RDP READY ==="
-          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "IP: $tsIP"
           Write-Host "USER: RDP"
-          Write-Host "PASS: $env:RDP_PASSWORD"  # Fallback if not echoed
+          Write-Host "PASS: $password"  # From earlier step
           Write-Host "================`n"
           
-          # Loop active
           while ($true) {
-              Write-Host "[$(Get-Date)] Active - Connect via Tailscale to IP: $env:TAILSCALE_IP"
+              Write-Host "[$(Get-Date)] Active - Connect via Tailscale to $tsIP"
               Start-Sleep -Seconds 300
           }
