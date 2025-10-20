@@ -64,11 +64,10 @@ jobs:
       - name: Install Tailscale with Retry
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.88.4-amd64.msi"  # Latest 1.88.4 x64 MSI
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"  # Original working version
           $tempDir = "C:\temp"
           $installerPath = "$tempDir\tailscale.msi"
           
-          # Create dir
           if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
           
           ipconfig /flushdns 2>$null
@@ -84,11 +83,12 @@ jobs:
               try {
                   Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 120 -ErrorAction Stop
                   $fileSize = (Get-Item $installerPath).Length
-                  if ($fileSize -gt 50000000) {  # ~50MB for 1.88.4
+                  Write-Host "Downloaded size: $fileSize bytes"
+                  if ((Test-Path $installerPath) -and $fileSize -gt 10000000) {  # Loose check >10MB for 1.82.0
                       $success = $true
-                      Write-Host "Download succeeded! Size: $fileSize bytes"
+                      Write-Host "Download succeeded!"
                   } else {
-                      throw "File too small"
+                      throw "File missing or too small ($fileSize bytes)"
                   }
               } catch {
                   Write-Host "Download failed: $($_.Exception.Message)"
