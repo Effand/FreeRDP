@@ -59,30 +59,44 @@ jobs:
           Write-Host "Password: $password"
           Write-Host "=========================="
 
-      - name: Install Tailscale with Retry
+      - name: Install Tailscale with Bitsadmin Retry
         shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          $maxRetries = 3
+          # Flush DNS cache to help resolution
+          ipconfig /flushdns 2>$null
+          $maxRetries = 5
           $retry = 0
           $success = $false
           while ($retry -lt $maxRetries -and -not $success) {
               try {
-                  Write-Host "Download attempt $($retry + 1)/$maxRetries"
-                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 60 -ErrorAction Stop
-                  $success = $true
-                  Write-Host "Download succeeded!"
+                  Write-Host "Download attempt $($retry + 1)/$maxRetries using bitsadmin"
+                  # Use bitsadmin for reliable download on Windows
+                  bitsadmin /transfer "TailscaleDownload" $tsUrl $installerPath /priority normal
+                  if (Test-Path $installerPath) {
+                      $fileSize = (Get-Item $installerPath).Length
+                      Write-Host "Downloaded file size: $fileSize bytes"
+                      if ($fileSize -gt 40000000) {  # ~40MB check
+                          $success = $true
+                          Write-Host "Download succeeded with bitsadmin!"
+                      } else {
+                          Remove-Item $installerPath -Force
+                          throw "File too small, retrying"
+                      }
+                  }
               } catch {
                   Write-Host "Download failed: $($_.Exception.Message)"
+                  if (Test-Path $installerPath) { Remove-Item $installerPath -Force }
                   $retry++
                   if ($retry -lt $maxRetries) {
-                      Start-Sleep -Seconds 10
+                      Start-Sleep -Seconds 15
+                      ipconfig /flushdns 2>$null  # Flush DNS each retry
                   }
               }
           }
           if (-not $success) {
-              Write-Error "Download failed after $maxRetries attempts"
+              Write-Error "Download failed after $maxRetries attempts - DNS/ network issue"
               exit 1
           }
           Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
